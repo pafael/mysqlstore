@@ -2,18 +2,20 @@ mysqlstore
 ==========
 
 Gorilla's Session Store Implementation for MySQL
+Forked from srinathgs/mysqlstore. Only difference:
+- data stored in the session encoded by GobEncoder in base64 in prod and in Json in dev 
 
 Installation
 ===========
 
-Run `go get github.com/srinathgs/mysqlstore` from command line. Gets installed in `$GOPATH`
+Run `go get github.com/pafael/mysqlstore` from command line. Gets installed in `$GOPATH`
 
 Usage
 =====
 
 `NewMysqlStore` takes the following paramaters
 
-    endpoint - A sql.Open style endpoint
+    endpoint - A sql.Open style endpoint (with option ?parseTime=true)
     tableName - table where sessions are to be saved. Required fields are created automatically if the table doesnot exist.
     path - path for Set-Cookie header
     maxAge 

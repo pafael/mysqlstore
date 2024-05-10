@@ -9,10 +9,11 @@ package mysqlstore
 
 import (
 	"database/sql"
-	"encoding/gob"
+	"database/sql/driver"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -32,20 +33,18 @@ type MySQLStore struct {
 	Codecs  []securecookie.Codec
 	Options *sessions.Options
 	table   string
+	Json bool
 }
 
 type sessionRow struct {
 	id         string
-	data       string
+	data       []byte
 	createdOn  time.Time
 	modifiedOn time.Time
 	expiresOn  time.Time
 }
 
-func init() {
-	gob.Register(time.Time{})
-}
-
+// endpoint string shoud have option "parseTime=true" for this package to work with mariadb
 func NewMySQLStore(endpoint string, tableName string, path string, maxAge int, keyPairs ...[]byte) (*MySQLStore, error) {
 	db, err := sql.Open("mysql", endpoint)
 	if err != nil {
@@ -61,7 +60,7 @@ func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxA
 
 	cTableQ := "CREATE TABLE IF NOT EXISTS " +
 		tableName + " (id INT NOT NULL AUTO_INCREMENT, " +
-		"session_data LONGBLOB, " +
+		"session_data BLOB, " +
 		"created_on TIMESTAMP DEFAULT NOW(), " +
 		"modified_on TIMESTAMP NOT NULL DEFAULT NOW() ON UPDATE CURRENT_TIMESTAMP, " +
 		"expires_on TIMESTAMP DEFAULT NOW(), PRIMARY KEY(`id`)) ENGINE=InnoDB;"
@@ -92,7 +91,7 @@ func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxA
 		return nil, stmtErr
 	}
 
-	updQ := "UPDATE " + tableName + " SET session_data = ?, created_on = ?, expires_on = ? " +
+	updQ := "UPDATE " + tableName + " SET session_data = ?, modified_on = ?, expires_on = ? " +
 		"WHERE id = ?"
 	stmtUpdate, stmtErr := db.Prepare(updQ)
 	if stmtErr != nil {
@@ -118,6 +117,7 @@ func NewMySQLStoreFromConnection(db *sql.DB, tableName string, path string, maxA
 			MaxAge: maxAge,
 		},
 		table: tableName,
+		Json: false,
 	}, nil
 }
 
@@ -151,9 +151,7 @@ func (m *MySQLStore) New(r *http.Request, name string) (*sessions.Session, error
 			err = m.load(session)
 			if err == nil {
 				session.IsNew = false
-			} else {
-				err = nil
-			}
+			}	
 		}
 	}
 	return session, err
@@ -177,39 +175,46 @@ func (m *MySQLStore) Save(r *http.Request, w http.ResponseWriter, session *sessi
 }
 
 func (m *MySQLStore) insert(session *sessions.Session) error {
-	var createdOn time.Time
-	var modifiedOn time.Time
-	var expiresOn time.Time
-	crOn := session.Values["created_on"]
-	if crOn == nil {
-		createdOn = time.Now()
-	} else {
-		createdOn = crOn.(time.Time)
-	}
-	modifiedOn = createdOn
-	exOn := session.Values["expires_on"]
-	if exOn == nil {
-		expiresOn = time.Now().Add(time.Second * time.Duration(session.Options.MaxAge))
-	} else {
-		expiresOn = exOn.(time.Time)
-	}
-	delete(session.Values, "created_on")
-	delete(session.Values, "expires_on")
-	delete(session.Values, "modified_on")
+	modifiedOn := time.Now()
+	expiresOn := modifiedOn.Add(time.Second * time.Duration(session.Options.MaxAge))
 
-	encoded, encErr := securecookie.EncodeMulti(session.Name(), session.Values, m.Codecs...)
-	if encErr != nil {
-		return encErr
+	delete(session.Values, "created_on")
+	delete(session.Values, "modified_on")
+	delete(session.Values, "expires_on")
+
+	var err error
+	var marshalled []byte
+
+	sessValues := make(map[string]interface{})
+	for k, v := range(session.Values){
+		sessValues[fmt.Sprint(k)] = v
 	}
-	res, insErr := m.stmtInsert.Exec(encoded, createdOn, modifiedOn, expiresOn)
-	if insErr != nil {
-		return insErr
+
+	if m.Json {
+		marshalled, err = json.Marshal(sessValues)
+	}else {
+		marshalled, err = (securecookie.GobEncoder{}).Serialize(sessValues)
+		encoded := make([]byte, base64.URLEncoding.EncodedLen(len(marshalled)))
+		base64.URLEncoding.Encode(encoded, marshalled)
+		marshalled = encoded
 	}
-	lastInserted, lInsErr := res.LastInsertId()
-	if lInsErr != nil {
-		return lInsErr
+
+	if err == nil {
+		var res driver.Result
+		res, err = m.stmtInsert.Exec(marshalled, modifiedOn, modifiedOn, expiresOn)
+		if err == nil {
+			var lastInserted int64
+			lastInserted, err = res.LastInsertId()
+			if err == nil {
+				session.ID = fmt.Sprintf("%d", lastInserted)
+			}
+		}
 	}
-	session.ID = fmt.Sprintf("%d", lastInserted)
+
+	if err != nil {
+		fmt.Println("Failed to insert session data to database")
+		return err
+	}
 	return nil
 }
 
@@ -223,7 +228,6 @@ func (m *MySQLStore) Delete(r *http.Request, w http.ResponseWriter, session *ses
 	for k := range session.Values {
 		delete(session.Values, k)
 	}
-
 	_, delErr := m.stmtDelete.Exec(session.ID)
 	if delErr != nil {
 		return delErr
@@ -232,61 +236,86 @@ func (m *MySQLStore) Delete(r *http.Request, w http.ResponseWriter, session *ses
 }
 
 func (m *MySQLStore) save(session *sessions.Session) error {
-	if session.IsNew == true {
+	if session.IsNew == true || session.ID == "" {
 		return m.insert(session)
 	}
-	var createdOn time.Time
 	var expiresOn time.Time
-	crOn := session.Values["created_on"]
-	if crOn == nil {
-		createdOn = time.Now()
-	} else {
-		createdOn = crOn.(time.Time)
-	}
 
-	exOn := session.Values["expires_on"]
-	if exOn == nil {
-		expiresOn = time.Now().Add(time.Second * time.Duration(session.Options.MaxAge))
-		log.Print("nil")
-	} else {
-		expiresOn = exOn.(time.Time)
-		if expiresOn.Sub(time.Now().Add(time.Second*time.Duration(session.Options.MaxAge))) < 0 {
-			expiresOn = time.Now().Add(time.Second * time.Duration(session.Options.MaxAge))
-		}
-	}
+	expiresOn = time.Now().Add(time.Second * time.Duration(session.Options.MaxAge))
 
 	delete(session.Values, "created_on")
-	delete(session.Values, "expires_on")
 	delete(session.Values, "modified_on")
-	encoded, encErr := securecookie.EncodeMulti(session.Name(), session.Values, m.Codecs...)
-	if encErr != nil {
-		return encErr
+	delete(session.Values, "expires_on")
+
+
+	var err error
+	var marshalled []byte
+
+	sessValues := make(map[string]interface{})
+	for k, v := range(session.Values){
+		sessValues[fmt.Sprint(k)] = v
 	}
-	_, updErr := m.stmtUpdate.Exec(encoded, createdOn, expiresOn, session.ID)
-	if updErr != nil {
-		return updErr
+
+	if m.Json { 
+		marshalled, err = json.Marshal(sessValues)
+	}else{
+		marshalled, err = (securecookie.GobEncoder{}).Serialize(sessValues)
+		encoded := make([]byte, base64.URLEncoding.EncodedLen(len(marshalled)))
+		base64.URLEncoding.Encode(encoded, marshalled)
+		marshalled = encoded
 	}
+
+	if err == nil {
+		_, err = m.stmtUpdate.Exec(marshalled, time.Now(), expiresOn, session.ID)
+	}
+
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (m *MySQLStore) load(session *sessions.Session) error {
+	var err error
 	row := m.stmtSelect.QueryRow(session.ID)
 	sess := sessionRow{}
-	scanErr := row.Scan(&sess.id, &sess.data, &sess.createdOn, &sess.modifiedOn, &sess.expiresOn)
-	if scanErr != nil {
-		return scanErr
-	}
-	if sess.expiresOn.Sub(time.Now()) < 0 {
-		log.Printf("Session expired on %s, but it is %s now.", sess.expiresOn, time.Now())
-		return errors.New("Session expired")
-	}
-	err := securecookie.DecodeMulti(session.Name(), sess.data, &session.Values, m.Codecs...)
+	err = row.Scan(&sess.id, &sess.data, &sess.createdOn, &sess.modifiedOn, &sess.expiresOn)
+
 	if err != nil {
 		return err
 	}
+
+	if sess.expiresOn.Before(time.Now()) {
+		return errors.New("Session expired")
+	}
+
+	var dataMap map[string]interface{}
+	
+	if m.Json {
+		err = json.Unmarshal(sess.data, &dataMap)
+	}
+
+	if !m.Json || err != nil {
+		dest := make([]byte, base64.URLEncoding.DecodedLen(len(sess.data)))
+		base64.URLEncoding.Decode(dest, sess.data)
+		dataMap = make(map[string]interface{}, 0)
+		err = (securecookie.GobEncoder{}).Deserialize(dest, &dataMap)
+	}
+
+	if err != nil {
+		fmt.Printf("Error decoding db session data: %v\n", err)
+		dataMap = make(map[string]interface{}, 0)
+	}
+
 	session.Values["created_on"] = sess.createdOn
 	session.Values["modified_on"] = sess.modifiedOn
 	session.Values["expires_on"] = sess.expiresOn
+
+	for k,v := range(dataMap) {
+		session.Values[k] = v
+	}
+
 	return nil
 
 }
